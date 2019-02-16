@@ -28,6 +28,10 @@
 #include "nuklear.h"
 #include "nuklear_glfw_gl3.h"
 
+#define PIXELWIDTH 512
+#define PIXELHEIGHT 960
+#define SPEED 2400
+
 static inline int itoa(int n, char *s) // positive integers only!
 {
 	int i = 0;
@@ -41,146 +45,7 @@ static inline int itoa(int n, char *s) // positive integers only!
 	return i;
 }
 
-static char *hostname;
-static int port;
-static int sockfd = 0;
-static void flutConnect()
-{
-	if (sockfd)
-		close(sockfd);
-
-	struct hostent *server;
-	server = gethostbyname(hostname);
-	if (server == NULL)
-	{
-		perror("ERROR no such host\n");
-		exit(1);
-	}
-	struct sockaddr_in serv_addr;
-	bzero((char *) &serv_addr, sizeof(serv_addr));
-	serv_addr.sin_family = AF_INET;
-	bcopy(server->h_addr_list[0], (char *)&serv_addr.sin_addr.s_addr, server->h_length);
-	serv_addr.sin_port = htons(port);
-
-	sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (sockfd < 0)
-	{
-		perror("ERROR opening socket\n");
-		exit(2);
-	}
-
-	if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &(int){ 1 }, sizeof(int)) < 0)
-	{
-		perror("setsockopt(SO_REUSEPORT) failed\n");
-		exit(3);
-	}
-	
-	if (connect(sockfd,(struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0)
-	{
-		perror("ERROR connecting\n");
-		exit(4);
-	}
-
-	fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK);
-	signal(SIGPIPE, SIG_IGN);
-}
-
-static int pixelsWidth = 640, pixelsHeight = 480;
 static uint8_t *pixels;
-static void readSize()
-{
-	// retrieve server screen resolution using the SIZE command
-	fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) & (~O_NONBLOCK)); // temporarily disable non-blocking mode
-	int n = write(sockfd, "SIZE\n", 5);
-	if (n == 5)
-	{
-		char result[256];
-		n = read(sockfd, result, 256);
-		if (n > 5 && !strncmp(result, "SIZE ", 5))
-		{
-			int w, h;
-			n = sscanf(result, "SIZE %d %d", &w, &h);
-			if (n == 2)
-			{
-				pixelsWidth = w;
-				pixelsHeight = h;
-				printf("Received screen size from server: %dx%d\n", pixelsWidth, pixelsHeight);
-			}
-			else
-				printf("Bad SIZE payload!\n");
-		}
-		else
-			printf("Bad SIZE response!\n");
-	}
-	else
-		printf("Could not send SIZE command!\n");
-	fcntl(sockfd, F_SETFL, fcntl(sockfd, F_GETFL, 0) | O_NONBLOCK); // reenable non-blocking mode
-}
-
-static int idleCounter = 0;
-static void keepAlive()
-{
-	if (++idleCounter >= 60)
-	{
-		idleCounter = 0;
-		const char nl = '\n';
-		int n = write(sockfd, &nl, 1);
-	}
-}
-
-static unsigned char buffer[1024], *p = buffer;
-static void setPixel(int x, int y, struct nk_color color)
-{
-	if (x < 0 || y < 0 || x >= pixelsWidth || y >= pixelsHeight)
-		return;
-
-	// flush buffer if necessary
-	while (buffer + 1024 - p < 32)
-	{
-		int n;
-		do
-		{
-			n = write(sockfd, buffer, p - buffer);
-		} while(n < 0 && errno == EAGAIN);
-		if (n < 0)
-		{
-			if (errno == EPIPE)
-			{
-				printf("reconnecting.\n");
-				flutConnect();
-			}
-			else
-			{
-				fprintf(stderr, "ERROR %d writing to socket\n", errno);
-				exit(1);
-			}
-		}
-		if (n > 0)
-		{
-			memmove(buffer, buffer + n, p - (buffer + n));
-			p -= n;
-			idleCounter = 0;
-		}
-	}
-
-	// add pixel to buffer
-	*p++ = 'P'; *p++ = 'X'; *p++ = ' ';
-	p += itoa(x, p); *p++ = ' ';
-	p += itoa(y, p); *p++ = ' ';
-	const unsigned char hex[] = "0123456789abcdef";
-	*p++ = hex[color.r >> 4]; *p++ = hex[color.r & 0xf];
-	*p++ = hex[color.g >> 4]; *p++ = hex[color.g & 0xf];
-	*p++ = hex[color.b >> 4]; *p++ = hex[color.b & 0xf];
-	*p++ = hex[color.a >> 4]; *p++ = hex[color.a & 0xf];
-	*p++ = '\n';
-	
-	// set pixel locally
-	float alpha = color.a / 255.0f, nalpha = 1.0f - alpha;
-	uint8_t *pixel = pixels + (y * pixelsWidth + x) * 3;
-	pixel[0] = (uint8_t)(pixel[0] * nalpha + color.r * alpha);
-	pixel[1] = (uint8_t)(pixel[1] * nalpha + color.g * alpha);
-	pixel[2] = (uint8_t)(pixel[2] * nalpha + color.b * alpha);
-}
 
 struct
 {
@@ -188,22 +53,25 @@ struct
 	struct nk_color color;
 	int currentLine;
 } fillState = {0};
+
 static void fillRect(int x, int y, int w, int h, struct nk_color color)
 {
 	fillState.x = x; fillState.y = y; fillState.w = w; fillState.h = h;
 	fillState.color = color;
 	fillState.currentLine = 0;
 }
-static int fillUpdate()
+
+static unsigned char buffer[1024], *p = buffer;
+static void setPixel(int x, int y, struct nk_color color)
 {
-	if (fillState.currentLine < fillState.h)
-	{
-		for (int x = 0; x < fillState.w; x++)
-			setPixel(fillState.x + x, fillState.y + fillState.currentLine, fillState.color);
-		fillState.currentLine++;
-		return 1;
-	}
-	return 0;
+	if (x < 0 || y < 0 || x >= PIXELWIDTH || y >= PIXELHEIGHT)
+		return;
+
+	float alpha = color.a / 255.0f, nalpha = 1.0f - alpha;
+	uint8_t *pixel = pixels + (y * PIXELWIDTH + x) * 3;
+	pixel[0] = (uint8_t)(pixel[0] * nalpha + color.r * alpha);
+	pixel[1] = (uint8_t)(pixel[1] * nalpha + color.g * alpha);
+	pixel[2] = (uint8_t)(pixel[2] * nalpha + color.b * alpha);
 }
 
 typedef struct
@@ -215,6 +83,7 @@ typedef struct
 	nk_size spray;
 	nk_size shape;
 } brush_t;
+
 static void brushPoint(int x, int y, brush_t *brush)
 {
 	float radius = brush->size / 2.0f;
@@ -248,6 +117,8 @@ static void brushPoint(int x, int y, brush_t *brush)
 
 static void brushLine(struct nk_vec2 p0, struct nk_vec2 p1, brush_t *brush)
 {
+	printf("G01 X%f Y%f S1000\n", p1.x-(PIXELWIDTH/2), PIXELHEIGHT-p1.y);
+
 	int x0 = (int)roundf(p0.x), y0 = (int)roundf(p0.y);
 	int x1 = (int)roundf(p1.x), y1 = (int)roundf(p1.y);
 	int dx = abs(x1 - x0), sx = x0 < x1 ? 1 : -1;
@@ -272,20 +143,7 @@ static void error_callback(int e, const char *d)
 
 int main(int argc, char **argv)
 {
-	if (argc < 3)
-	{
-		fprintf(stderr, "usage %s hostname port\n", argv[0]);
-		exit(0);
-	}
-
-	struct timeval T1;
-	srand(T1.tv_usec);
-
-	hostname = argv[1];
-	port = atoi(argv[2]);
-	flutConnect();
-	readSize();
-
+	
 	glfwSetErrorCallback(error_callback);
 	if (!glfwInit())
 	{
@@ -298,12 +156,12 @@ int main(int argc, char **argv)
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 	#endif
-	GLFWwindow *window = glfwCreateWindow(232 + pixelsWidth, pixelsHeight + 96, "Pinselflut", NULL, NULL);
+	GLFWwindow *window = glfwCreateWindow(232 + PIXELWIDTH, PIXELHEIGHT + 96, "Pinselflut", NULL, NULL);
 	glfwMakeContextCurrent(window);
 	gladLoadGLLoader((GLADloadproc)glfwGetProcAddress);
 	glfwSwapInterval(1);
-	
-	pixels = calloc(pixelsWidth * pixelsHeight * 3, 1);
+
+	pixels = calloc(PIXELWIDTH * PIXELHEIGHT * 3, 1);
 	GLuint texture;
 	glGenTextures(1, &texture);
 	glBindTexture(GL_TEXTURE_2D, texture);
@@ -311,7 +169,7 @@ int main(int argc, char **argv)
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, pixelsWidth, pixelsHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, PIXELWIDTH, PIXELHEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels);
 
 	struct nk_context *ctx = nk_glfw3_init(window, NK_GLFW3_INSTALL_CALLBACKS);
 	struct nk_font_atlas *atlas;
@@ -348,7 +206,9 @@ int main(int argc, char **argv)
 	brushes[1].spray = 1;
 	brushes[1].shape = 10;
 	brush_t *bg = &brushes[1];
-
+	
+	printf("G95 M%i\n", SPEED);
+	
 	while (!glfwWindowShouldClose(window))
 	{
 		glfwPollEvents();
@@ -356,16 +216,16 @@ int main(int argc, char **argv)
 		glfwGetFramebufferSize(window, &w, &h);
 		nk_glfw3_new_frame();
 
-		keepAlive();
+		//keepAlive();
 
 		glBindTexture(GL_TEXTURE_2D, texture);
-		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, pixelsWidth, pixelsHeight, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, PIXELWIDTH, PIXELHEIGHT, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels);
 		struct nk_panel canvas;
-		if (nk_begin(ctx, &canvas, "Canvas", nk_rect(200, 0, pixelsWidth + 32, pixelsHeight + 96),
+		if (nk_begin(ctx, &canvas, "Canvas", nk_rect(200, 0, PIXELWIDTH + 32, PIXELHEIGHT + 96),
 			NK_WINDOW_BORDER|NK_WINDOW_MOVABLE|//NK_WINDOW_SCALABLE|
 			NK_WINDOW_MINIMIZABLE|NK_WINDOW_TITLE))
 		{
-			nk_layout_row_static(ctx, pixelsHeight, pixelsWidth, 1);
+			nk_layout_row_static(ctx, PIXELHEIGHT, PIXELWIDTH, 1);
 			struct nk_vec2 canvasPosition = nk_widget_position(ctx);
 			nk_image(ctx, nk_image_id(texture));
 
@@ -388,16 +248,17 @@ int main(int argc, char **argv)
 						sumy += stabilizer.positions[i].y;
 					}
 					struct nk_vec2 avg = nk_vec2(sumx / brush->stabilization, sumy / brush->stabilization);
-					if (avg.x >= 0 && avg.y >= 0 && avg.x <= pixelsWidth - 1 && avg.y <= pixelsHeight - 1)
+					if (avg.x >= 0 && avg.y >= 0 && avg.x <= PIXELWIDTH - 1 && avg.y <= PIXELHEIGHT - 1)
 					{
 						if (stabilizer.lastAverage.x == -1 && stabilizer.lastAverage.y == -1)
 							stabilizer.lastAverage = avg;
 						if ((int)roundf(avg.x) != (int)roundf(stabilizer.lastAverage.x) ||
 							(int)roundf(avg.y) != (int)roundf(stabilizer.lastAverage.y))
 							brushLine(stabilizer.lastAverage, avg, brush);
+						else printf("G00 X%f Y%F S0\n",avg.x-(PIXELWIDTH/2),PIXELHEIGHT-avg.y);
 						stabilizer.lastAverage = avg;
 					}
-					
+
 					// make room for next mouse position in stabilizer buffer
 					for (int i = 0; i < stabilizer.writeIndex - 1; i++)
 						stabilizer.positions[i] = stabilizer.positions[i + 1];
@@ -413,7 +274,7 @@ int main(int argc, char **argv)
 		nk_end(ctx);
 
 		struct nk_panel tools;
-		if (nk_begin(ctx, &tools, "Tools", nk_rect(0, 0, 200, pixelsHeight + 96),
+		if (nk_begin(ctx, &tools, "Tools", nk_rect(0, 0, 200, PIXELHEIGHT + 96),
 			NK_WINDOW_BORDER|NK_WINDOW_MOVABLE|NK_WINDOW_SCALABLE|
 			NK_WINDOW_MINIMIZABLE|NK_WINDOW_TITLE))
 		{
@@ -425,7 +286,7 @@ int main(int argc, char **argv)
 				if (brushes + i == fg) fgIndex = i;
 				if (brushes + i == bg) bgIndex = i;
 			}
-			
+
 			nk_layout_row_dynamic(ctx, 15, 1);
 			nk_label(ctx, "Primary Brush:", NK_TEXT_LEFT);
 			nk_layout_row_dynamic(ctx, 25, 1);
@@ -489,15 +350,15 @@ int main(int argc, char **argv)
 
 					nk_layout_row_dynamic(ctx, 20, 1);
 					if (nk_button_label(ctx, "Fill Canvas", NK_BUTTON_DEFAULT))
-						fillRect(0, 0, pixelsWidth, pixelsHeight, brush->color);
-					
+						fillRect(0, 0, PIXELWIDTH, PIXELHEIGHT, brush->color);
+
 					if (brushCount > 1)
 					{
 						nk_layout_row_dynamic(ctx, 20, 1);
 						if (nk_button_label(ctx, "Delete Brush", NK_BUTTON_DEFAULT))
 							toDelete = i;
 					}
-					
+
 					nk_tree_pop(ctx);
 				}
 			}
@@ -515,7 +376,7 @@ int main(int argc, char **argv)
 					brushCount++;
 				}
 			}
-			
+
 			if (toDelete >= 0)
 			{
 				brushCount--;
@@ -529,12 +390,12 @@ int main(int argc, char **argv)
 
 			fg = brushes + fgIndex;
 			bg = brushes + bgIndex;
-
+			/*
 			if (fillUpdate())
 			{
 				nk_layout_row_dynamic(ctx, 15, 1);
 				nk_label(ctx, "Filling in progress", NK_TEXT_LEFT);
-			}
+			}*/
 		}
 		nk_end(ctx);
 
@@ -547,8 +408,7 @@ int main(int argc, char **argv)
 	nk_glfw3_shutdown();
 	free(pixels);
 	glfwTerminate();
-	
-	close(sockfd);
+	//close(sockfd);
 	return 0;
 }
 
